@@ -34,6 +34,8 @@ from . import data_service
 from .data_service import REP_IDS
 
 MODEL_NAME = "gpt-4o-mini"
+SCORING_FIELDS = ("annual_revenue", "tech_stack", "account_details", "segment")
+CONTACT_FIELDS = ("name", "email", "annual_revenue", "disqualified", "enrichment_source")
 
 # ---------------------------------------------------------------------------
 # Tools
@@ -47,24 +49,30 @@ def lookup_offering(offering_id: str) -> dict:
     return {"offering": record, "found": True}
 
 
+def _sanitize_prospect_profile(prospect_id: str, profile: dict) -> dict:
+    "Return only the non-contact fields used by prospect profiles and scoring."
+    return data_service._sanitize_profile(prospect_id, profile)
+
+
 @tool
 def build_prospect_profile(prospect_id: str) -> dict:
-    "Assemble a full prospect profile (engagement history, account details, tech stack) and store it. Returns the profile and a found flag."
+    "Assemble and store a non-contact profile from revenue, engagement history, account details, and tech stack. Returns the profile and a found flag."
     existing = data_service.get_profile_from_db(prospect_id)["prospect_profile"]
     if existing is not None:
-        return {"prospect_profile": existing, "found": True}
+        profile = _sanitize_prospect_profile(prospect_id, existing)
+        data_service.save_profile_to_db(prospect_id, profile)
+        return {"prospect_profile": profile, "found": True}
     rec = data_service.get_prospect_record(prospect_id)
     if rec is None:
         return {"prospect_profile": None, "found": False}
-    built = {
-        "prospect_id": prospect_id,
-        **rec,
+    profile = _sanitize_prospect_profile(prospect_id, {
+        "annual_revenue": rec.get("annual_revenue"),
         "engagement_history": data_service.fetch_engagement_history(prospect_id),
         "account_details": data_service.fetch_account_details(prospect_id),
         "tech_stack": data_service.fetch_tech_stack(prospect_id),
-    }
-    data_service.save_profile_to_db(prospect_id, built)
-    return {"prospect_profile": built, "found": True}
+    })
+    data_service.save_profile_to_db(prospect_id, profile)
+    return {"prospect_profile": profile, "found": True}
 
 
 SCORING_PROMPT = (
@@ -107,13 +115,17 @@ def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict
     "Score a prospect profile's potential for an offering on a 1-100 scale with a justification. Pass the complete prospect_profile record returned by build_prospect_profile and the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
     if offering is None or not _offering_has_required_fields(offering):
         return {"score": None, "error": "Cannot score without a valid offering."}
-    # Score against the prospect's saved tech stack of record.
     pid = prospect_profile.get("prospect_id")
+    scoring_profile = {
+        field: prospect_profile[field]
+        for field in SCORING_FIELDS
+        if field in prospect_profile
+    }
     if pid is not None:
-        prospect_profile = {**prospect_profile, "tech_stack": data_service.fetch_tech_stack(pid)}
+        scoring_profile["tech_stack"] = data_service.fetch_tech_stack(pid)
     user = (
         "Offering:\n" + json.dumps(offering, indent=2) +
-        "\n\nProspect profile:\n" + json.dumps(prospect_profile, indent=2)
+        "\n\nProspect profile:\n" + json.dumps(scoring_profile, indent=2)
     )
     result = _scoring_llm.invoke([
         {"role": "system", "content": SCORING_PROMPT},
@@ -128,12 +140,9 @@ def get_prospect(prospect_id: str) -> dict:
     record = data_service.get_prospect_record(prospect_id)
     if record is None:
         return {"prospect": None, "found": False}
-    # Carry the contact fields through, dropping the bulky enrichment blobs the
-    # caller can pull from build_prospect_profile instead.
     contact = {
         "prospect_id": prospect_id,
-        **{k: v for k, v in record.items()
-           if k not in ("engagement_history", "account_details", "tech_stack")},
+        **{field: record[field] for field in CONTACT_FIELDS if field in record},
     }
     return {"prospect": contact, "found": True}
 
