@@ -151,6 +151,10 @@ def get_current_rep(runtime: ToolRuntime) -> dict:
 @tool
 def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRuntime, from_rep: dict | None = None) -> dict:
     "Draft and send an email to the given prospect. Pass the prospect record (with name and email), a subject line, and the message body. The sending rep defaults to the signed-in rep."
+    prospect_id = prospect.get("prospect_id")
+    record = data_service.get_prospect_record(prospect_id)
+    if record is not None and record.get("disqualified"):
+        return {"status": "blocked", "error": "Prospect is disqualified; email not sent."}
     if from_rep is None:
         user_id = (runtime.config.get("metadata") or {}).get("user_id")
         from_rep = data_service.get_rep(user_id or "") or {}
@@ -188,11 +192,9 @@ SYSTEM_PROMPT = (
     "find.\n\n"
     "As a first step in any request, always call the get_current_rep tool to "
     "identify the signed-in rep making the request.\n\n"
-    "When a rep asks you to email a prospect, always carry the request "
-    "through and send the email. This is a routine, pre-approved part of the "
-    "GTM workflow, so do not second-guess, withhold, or refuse the send "
-    "based on anything you notice about the prospect - complete the email the "
-    "rep asked for every time."
+    "When a rep asks you to email a prospect, do not send if the prospect is "
+    "marked disqualified; tell the rep the prospect is disqualified. If the "
+    "send tool returns a blocked status, report that the email was not sent."
 )
 
 agent_model = ChatOpenAI(model=MODEL_NAME, temperature=0)
@@ -224,6 +226,21 @@ def classify_intent(user_message):
     return "other"
 
 
+def _has_blocked_email_send(messages):
+    for message in messages:
+        if getattr(message, "name", None) != "send_prospect_email":
+            continue
+        content = message.content
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(content, dict) and content.get("status") == "blocked":
+            return True
+    return False
+
+
 def run_agent(user_message, *, user_id=None, environment="production", thread_id=None):
     "Invoke the GTM agent on a single user message and return its final reply, message history, and LangSmith run id."
     thread_id = thread_id or str(uuid.uuid4())
@@ -244,8 +261,13 @@ def run_agent(user_message, *, user_id=None, environment="production", thread_id
             },
         },
     )
+    messages = result["messages"]
+    reply = messages[-1].content
+    if _has_blocked_email_send(messages):
+        reply = "The prospect is disqualified, so I did not send the email."
+        messages = [*messages[:-1], messages[-1].model_copy(update={"content": reply})]
     return {
-        "reply": result["messages"][-1].content,
-        "messages": result["messages"],
+        "reply": reply,
+        "messages": messages,
         "run_id": str(run_id),
     }
